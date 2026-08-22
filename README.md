@@ -195,10 +195,10 @@ Five steps, in order. Order matters: aim accuracy is limited by camera noise, so
 tuning before calibrating is not optional — the app blocks step 3 if the noise
 floor is too high.
 
-1 — Buttons & pins. Opens the OpenFIRE desktop app, which needs the serial port 
+**1 — Buttons & pins.** Opens the OpenFIRE desktop app, which needs the serial port 
 to itself. You do not need to run OpenFIRE's own calibration — this build skips 
 its first-boot hold and goes straight to Run mode, because the overlay stores 
-its calibration separately and steps 3 to 5 replace that job. Set your trigger 
+its calibration separately and steps 4 to 6 replace that job. Set your trigger 
 and pins there, then just close it — Studio waits for it to exit, takes the port 
 back and reconnects on its own. Reconnect in the header is there if you ever need 
 to force it.
@@ -206,26 +206,45 @@ to force it.
 **2 — Camera tuning.** Exposure, gain and threshold. Aim for a blob noise floor
 **under 0.30 px**; 0.60 is the limit. `Auto` sweeps for you.
 
-**3 — Aim calibration.** Five dots at each of two or three distances. Aim, pull
+**3 — Lens / FOV.** Skip this on the stock 66° lens — it needs nothing here.
+If you fitted a wide or fisheye lens, the LED quad reaches the pipeline bent,
+the homography assumes a pinhole, and the calibration has nowhere to put a
+radially-varying error — so it must be corrected upstream, in the firmware, and
+this step configures that. Two ways: **Preset from FOV** (type the lens
+listing's field of view; good first approximation for fisheye lenses) or
+**Measure** — a guided 20-second sweep: stand ~2 m from the rig, feet planted,
+and slowly pan/tilt/roll so the LEDs travel out to the image edges. It fits
+both distortion models, applies the better one, and refuses honestly when the
+sweep did not cover enough of the frame to pin the answer. **Save to gun**
+persists it; it reloads at every boot. Know the trade: a wide lens lets you
+stand closer, but the shorter focal magnifies every noise source on screen.
+
+**4 — Aim calibration.** Five dots at each of two or three distances. Aim, pull
 the trigger four times per dot. Stepping back between rounds is **required** —
 at one distance the boresight and the screen mapping cannot be separated, and
 the fit will refuse. It ends by sending the calibration to the gun and reading
 it back to confirm.
 
-**4 — Fine tune.** Lines the cursor up with your **iron sights**, which is not
-where the camera points. Shoot the ring, nudge with the four arrow buttons if
-needed, step back, repeat. Two positions are needed because a sight offset can be
-angular (grows with distance) or parallax (constant), and the wrong correction is
-worse than none. `LEAD ±` trades latency for overshoot — raise it while the cursor
-trails you, stop as soon as it overshoots when you reverse direction. You will see a big difference here
+**5 — Fine tune.** Lines the cursor up with your **iron sights**, which is not
+where the camera points. The full flow: shoot the ring, nudge with the arrows if
+needed, step back, repeat — two positions let it separate an angular offset
+(grows with distance) from a parallax one (constant), and the wrong correction
+is worse than none. The short flow: skip the ring entirely, nudge with the
+arrows until the cursor sits on your notch, and press **SAVE NOW** — that keeps
+exactly what you see as a constant offset from one position. Mixing them is
+safe: a ring shot only measures what is left after your nudges, so nothing is
+ever counted twice. `LEAD ±` trades latency for overshoot — raise it while the
+cursor trails you, stop as soon as it overshoots when you reverse direction.
+You will see a big difference here
 
-**5 — Verify.** Shoots a nine-point grid and reports the error of the pipeline
+**6 — Verify.** Shoots a nine-point grid and reports the error of the pipeline
 alone against the error after the OS. If the two agree, any remaining error is
 the calibration's, not your driver's.
 
 **F9** freezes the cursor while Studio is open, so the gun stops fighting you
-for the mouse. It is released automatically for steps 3 to 5 and restored when
+for the mouse. It is released automatically for steps 4 to 6 and restored when
 you quit. It is never saved — a power cycle always gives you the cursor back.
+
 
 ---
 
@@ -265,9 +284,7 @@ LEDs with a long one.
 
 **`UnknownBoard: Unknown board ID 'ESP32-S3-WROOM-1-DevKitC-1-N8R2'`**
 
-An older copy of this project looked for the board definition inside the
-OpenFIRE checkout, so it could not be found before that checkout existed. The
-definition now ships in `boards/` and resolves on its own. If you still see
+The definition now ships in `boards/` and resolves on its own. If you still see
 this, your `platformio.ini` line should read `boards_dir = boards`.
 
 **The build stops with `SETUP INCOMPLETE`**
@@ -336,10 +353,22 @@ takes about a minute and corrects it either way.
 The fine-tune split needs two positions far enough apart. Redo step 4 and step
 well back for the second one.
 
+**A freshly flashed gun blinks orange and never moves the cursor**
+
+Stock OpenFIRE treats a profile whose four edge offsets are all zero as "never
+calibrated" and holds at boot until you either pull the trigger into its own
+calibration or set offsets from the desktop app. Since the overlay keeps its
+calibration in a separate NVS namespace, those zeros mean nothing to it, and
+the hold blocked the Run loop that emits the trigger markers step 3 needs — so
+a new gun could not calibrate its way out. This build skips that hold. If you
+still see it, you are running a firmware built before the fix. A camera that
+failed to start still holds, and that one is a real fault: check the ribbon.
+
 **The gun stops moving the cursor**
 
 Studio froze it and did not get to restore it. Reopen Studio and press **F9**,
 or unplug and replug — the freeze is never stored.
+
 
 ---
 
