@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""gun_studio.py -- the front door for setting up the lightgun.
+"""Lightgun Studio -- one window that walks the whole setup, in order:
 
-    python tools/gun_studio.py
+  1 buttons & pins (OpenFIRE app)   2 camera tuning   3 lens / FOV
+  4 aim calibration                 5 fine tune       6 verify
 
-One window, five steps: buttons/pins, camera tuning, aim calibration, fine tune,
-verify. Requires pyserial, numpy, tkinter.
-"""
+Order matters: aim error scales with blob noise, so the calibration step stays
+locked until step 2 reports a usable noise floor. Step 3 only matters when the
+camera does not wear the stock 66-degree lens. F9 freezes the cursor while the
+window is open; steps that need the gun release it and put it back."""
 import os, sys, subprocess, threading, queue, time
 import numpy as np
 
@@ -15,14 +17,18 @@ import aim_fit
 from aim_calib import (parse_q, is_trigger, sigma_from_hold, find_gun,
                        SerialSource, FRAME_W, FRAME_H)
 
-SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; gates step 3
-APP_PORT_WAIT_S = 60.0                 # keep trying this long after their app exits
+SIGMA_GOOD, SIGMA_OK = 0.30, 0.60      # px; see the note above for why this gates
+APP_PORT_WAIT_S = 60.0                 # how long to keep trying after their app exits
 CAM_KEYS = ("thr", "aec", "agc", "boost")
+LENS_KEYS = ("lens", "lk1u", "lk2u", "lfpx", "lfeq")
 CAM_RANGE = {"thr": (8, 200), "aec": (4, 400), "agc": (0, 30), "boost": (0, 1)}
 
 
 def port_is_free(port):
-    # Is the port openable right now. Never touches Link: the tick loop owns it.
+    """Can this port be opened right now? Used only to tell whether another
+       process still holds it. Deliberately does NOT touch the Link object --
+       that one is owned by the Tk tick loop and opening it from a worker
+       thread would race the pump()."""
     try:
         import serial
         s = serial.Serial(port, 115200, timeout=0.2)
@@ -34,9 +40,15 @@ def port_is_free(port):
 
 def take_port_back(proc, port, timeout_s=APP_PORT_WAIT_S, probe=port_is_free,
                    sleep=time.sleep, clock=time.monotonic):
-    # Wait for their app to exit AND the port to open again; two separate waits
-    # because a launcher can exit while the real app still holds the port.
-    # Always returns, so the caller always gets to reconnect.
+    """Block until `proc` has exited AND `port` can be opened again.
+
+       Returns "no port", "free" or "timeout". The caller reconnects either way:
+       a timeout is a thing to report, not a reason to leave the UI parked on a
+       status that will never change on its own.
+
+       The two waits are separate on purpose. Some launchers start the real app
+       in a second process and exit immediately, so proc.wait() returning does
+       not mean the port is back."""
     try:
         if proc is not None:
             proc.wait()
@@ -81,15 +93,29 @@ class Link:
 
     def send(self, line):
         if not self.src: return
-        # The '~' prefix is required: the gatekeeper on the shared serial only
-        # claims lines starting with '~'; anything else goes to OpenFIRE.
+        # The '~' matters. aim_runtime_command accepts a bare name, but the
+        # gatekeeper on the shared serial only CLAIMS lines starting with '~' --
+        # anything else is passed through to OpenFIRE and silently discarded.
+        # An auto-installed calibration went missing exactly this way.
         if not line.startswith("~"): line = "~" + line
         try: self.src.ser.write(("\n%s\n" % line).encode())
         except Exception: pass
 
     def pointer(self, on, remember=True):
-        """Freeze or release the cursor; remember=False forces it on temporarily."""
-        # Only possible while we own the serial port: force it on before handing over.
+        """Freeze or release the cursor.
+
+        The gun boots with the pointer ON and this app does NOT take it away by
+        itself -- freezing is a thing the user asks for, with a key, and the
+        window says so. Doing it silently on connect meant opening the app made
+        the gun stop working with no visible cause.
+
+        `remember=False` forces the pointer on temporarily (calibration, verify,
+        or handing the port to another app) without forgetting that the user had
+        chosen frozen, so their choice comes back afterwards.
+
+        RULE: we can only change this while we own the serial port. Every path
+        that gives the port away must force it ON first, or the user is left
+        frozen until they replug."""
         if remember:
             self.hid_on = on
         self.send("~aimhid=%d" % (1 if on else 0))
@@ -111,7 +137,7 @@ class Link:
                     for tok in line.replace("|", " ").split():
                         if "=" in tok:
                             k, v = tok.split("=", 1)
-                            if k in CAM_KEYS:
+                            if k in CAM_KEYS or k in LENS_KEYS:
                                 try: self.last[k] = int(v)
                                 except ValueError: pass
                 continue
@@ -131,7 +157,8 @@ class Link:
         """blob noise with hand tremor removed; None until enough frames"""
         if len(self.hist) < 40: return None
         a = np.array([h[1] for h in self.hist[-120:]])
-        # only use a stretch where the hand was reasonably still
+        # only use a stretch where the hand was reasonably still, or tremor
+        # dominates and the number means nothing
         cen = a.mean(1)
         if max(np.ptp(cen[:, 0]), np.ptp(cen[:, 1])) > 12.0: return None
         return sigma_from_hold(a)
@@ -150,7 +177,12 @@ class Link:
 # auto-tune: find an exposure/threshold that gives four stable blobs quietly
 # ---------------------------------------------------------------------------
 def auto_tune(link, log, stop):
-    """Sweep aec x thr and apply the best: four-blob rate first, sigma breaks ties."""
+    """Sweep aec x thr, score each point, apply the best.
+
+    Score is deliberately NOT "lowest sigma": a very high threshold gives
+    beautiful sigma on two surviving blobs, which is useless. Four blobs, seen on
+    essentially every frame, comes first; sigma only breaks ties.
+    """
     best = None
     aecs = [20, 30, 40, 60, 90]
     thrs = [40, 60, 80, 110, 150]
@@ -171,7 +203,8 @@ def auto_tune(link, log, stop):
                 log("  aec=%-3d thr=%-3d  no frames" % (aec, thr)); continue
             sg = link.sigma()
             spans = [aim_fit.quad_span(h[1]) for h in link.hist]
-            # every streamed frame already has 4 blobs, so fps IS the four-blob rate
+            # every frame in the stream already has 4 blobs (parse_q drops the
+            # rest), so "frames per second" IS the four-blob hit rate
             rate = n / 0.9
             score = (rate, -(sg if sg is not None else 9.9))
             log("  aec=%-3d thr=%-3d  %5.0f fps  span %5.1f  sigma %s"
@@ -217,10 +250,15 @@ def main():
     head = tk.Frame(root, bg=C_BG); head.pack(fill="x", padx=16, pady=(14, 6))
     lab(head, "Lightgun Studio", FH).pack(side="left")
     st_conn = lab(head, "not connected", F, C_BAD); st_conn.pack(side="right")
-    # the pointer toggle is a MODE, so the header always shows which one is active
+    # The pointer toggle lives in the header because it is a MODE, not an
+    # action, and the window has to say which mode it is in -- a gun that has
+    # silently stopped moving the cursor is indistinguishable from a broken gun.
     st_hid = lab(head, "", F, C_OK); st_hid.pack(side="right", padx=(0, 18))
-    # How many distances to calibrate from. More than one is required: at a single
-    # distance the boresight and the screen mapping are degenerate and the fit refuses.
+    # How many distances to calibrate from. Two is measured to be as good as
+    # three (65.7 vs 63.6 px at blob sigma 0.3, identical at 0.6) and saves 20
+    # trigger pulls, and not every room lets you take three steps back. What is
+    # NOT optional is more than one: at a single distance the boresight and the
+    # screen mapping are exactly degenerate and the fit refuses.
     stance_n = tk.IntVar(value=3)
 
     body = tk.Frame(root, bg=C_BG); body.pack(fill="both", expand=True, padx=16, pady=8)
@@ -231,9 +269,10 @@ def main():
     for n, (num, title, sub) in enumerate([
         (1, "Buttons & pins", "opens the OpenFIRE app"),
         (2, "Camera tuning",  "exposure, threshold, noise floor"),
-        (3, "Aim calibration","five dots x three distances"),
-        (4, "Fine tune",      "iron sights to cursor, and lead"),
-        (5, "Verify",         "measures whose error it is")]):
+        (3, "Lens / FOV",     "only if your lens is not the stock 66\u00b0"),
+        (4, "Aim calibration","five dots x three distances"),
+        (5, "Fine tune",      "iron sights to cursor, and lead"),
+        (6, "Verify",         "measures whose error it is")]):
         f = tk.Frame(left, bg=C_BG); f.pack(fill="x", pady=5)
         b = tk.Button(f, text="%d.  %s" % (num, title), font=FB, width=22, anchor="w",
                       bg="#161b22", fg=C_FG, activebackground="#21262d",
@@ -241,8 +280,10 @@ def main():
         b.pack(fill="x")
         s = lab(f, "   " + sub, (F[0], 9), C_DIM, anchor="w"); s.pack(fill="x")
         step_rows[num] = (b, s)
-        if num == 3:
-            # distance count, next to the step it applies to
+        if num == 4:
+            # Distance count, next to the step it applies to. Two positions is
+            # measured to be as good as three and saves 20 trigger pulls; some
+            # rooms simply do not allow three.
             rowd = tk.Frame(left, bg=C_BG); rowd.pack(fill="x", pady=(2, 0))
             lab(rowd, "   distances:", (F[0], 9), C_DIM).pack(side="left")
             for nval in (2, 3):
@@ -250,7 +291,7 @@ def main():
                                font=(F[0], 9), bg=C_BG, fg=C_FG, selectcolor="#161b22",
                                activebackground=C_BG, activeforeground=C_FG,
                                highlightthickness=0, bd=0,
-                               command=lambda: step_rows[3][1].config(
+                               command=lambda: step_rows[4][1].config(
                                    text="   five dots x %d distances" % stance_n.get())
                                ).pack(side="left")
             lab(rowd, "(2 is nearly as good and 20 fewer pulls)",
@@ -303,7 +344,8 @@ def main():
             if not exe: return
         # Their app needs the port to itself, so hand it over and take it back.
         log("Releasing the port and starting the OpenFIRE app...")
-        # release the pointer while we still own the port
+        # Once the port is gone we cannot send ~aimhid any more, so a frozen
+        # pointer would be stuck until a replug. Release it while we still can.
         link.pointer(True, remember=False)
         link.close()
         st_conn.config(text="OpenFIRE app has the port -- close it to come back",
@@ -314,11 +356,16 @@ def main():
             log("could not start it: %s" % e); reconnect(); return
         log("Set your pins and buttons there, then just CLOSE it.")
 
-        # Come back on our own when their app exits; steps 3-5 already do this
-        # because they call a tool we wrote.
+        # Steps 3-5 come back on their own because they subprocess.call() a tool
+        # we wrote. This one launches somebody else's app, so it used to end at
+        # Popen and leave the status stuck on 'handed off' until the user found
+        # the Reconnect button -- which reads as a hang, not a prompt. Wait for
+        # it here instead. Their app may also hand off to a second process and
+        # exit at once, so the port can still be held after wait() returns:
+        # probe it directly (never through `link`, which the tick loop owns)
+        # until it comes free.
         def take_the_port_back():
             why = take_port_back(proc, link.port or "")
-
             def done():
                 if why == "timeout":
                     log("The port is still held after %ds -- something else has it."
@@ -336,6 +383,9 @@ def main():
         nb.select(tab_cam)
 
     def step3():
+        nb.select(tab_lens)
+
+    def step4():
         sg = link.sigma()
         if sg is not None and sg > SIGMA_OK:
             from tkinter import messagebox
@@ -363,7 +413,8 @@ def main():
         threading.Thread(target=run, daemon=True).start()
 
     def _handoff(tool, label):
-        """Force the pointer on for a child window, then restore the user's choice."""
+        """Every child window drives the cursor with the gun, so the pointer has
+           to be live -- and it has to come back to whatever the user chose."""
         log("Handing the port to the %s window..." % label)
         link.pointer(True, remember=False)
         link.close()
@@ -377,14 +428,15 @@ def main():
             root.after(0, reconnect)
         threading.Thread(target=run, daemon=True).start()
 
-    def step4(): _handoff("aim_finetune.py", "fine tune")
-    def step5(): _handoff("aim_verify.py", "verify")
+    def step5(): _handoff("aim_finetune.py", "fine tune")
+    def step6(): _handoff("aim_verify.py", "verify")
 
     step_rows[1][0].config(command=step1)
     step_rows[2][0].config(command=step2)
     step_rows[3][0].config(command=step3)
     step_rows[4][0].config(command=step4)
     step_rows[5][0].config(command=step5)
+    step_rows[6][0].config(command=step6)
 
     # ---- tabs: camera tuning lives here ---------------------------------
     nb = ttk.Notebook(right)
@@ -426,6 +478,149 @@ def main():
     tk.Button(bar, text="Cancel", command=stop_flag.set,
               font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="right")
 
+    # ---- tab: lens / FOV --------------------------------------------------
+    # Only matters when the camera does not wear the stock 66-degree lens. A
+    # wide or fisheye lens bends the LED quad; the homography assumes a pinhole,
+    # and the calibration has nowhere to put a radially-varying error -- so the
+    # correction has to happen upstream, on the blob centroids, in the firmware.
+    # This tab sets that correction: a preset from the datasheet FOV, or a
+    # measured fit from a 20-second sweep. Save writes it to NVS with ~camsave.
+    import calib_lens
+    tab_lens = tk.Frame(nb, bg=C_BG)
+    nb.add(tab_lens, text="  Lens  ")
+
+    lens_state = lab(tab_lens, "current: unknown -- press Read from gun", (F[0], 9), C_DIM,
+                     anchor="w")
+    lens_state.pack(fill="x", pady=(6, 2))
+
+    rowp = tk.Frame(tab_lens, bg=C_BG); rowp.pack(fill="x", pady=3)
+    lab(rowp, "lens FOV:", F, C_DIM).pack(side="left")
+    fov_var = tk.StringVar(value="66")
+    tk.Entry(rowp, textvariable=fov_var, width=5, font=F, bg="#161b22", fg=C_FG,
+             insertbackground=C_FG, relief="flat").pack(side="left", padx=(4, 2))
+    lab(rowp, "deg (full horizontal, from the lens listing)", (F[0], 9), C_DIM).pack(side="left")
+
+    def fov_value():
+        try:
+            v = float(fov_var.get())
+            if 30 <= v <= 200: return v
+        except ValueError:
+            pass
+        log("lens: FOV must be a number between 30 and 200 degrees")
+        return None
+
+    def lens_off():
+        link.send("~cam=lens:0")
+        log("lens: correction OFF (stock lens). Press Save to keep it.")
+
+    def lens_preset():
+        fov = fov_value()
+        if fov is None: return
+        if fov <= 75:
+            log("lens: %.0f deg is close enough to a pinhole that no preset is"
+                " needed -- the calibration absorbs the focal length itself."
+                " Use Measure if the image is visibly bent." % fov)
+            return
+        r = calib_lens.spec_fisheye(fov)
+        link.send("~cam=" + calib_lens.tune_line(dict(r, model="fisheye")))
+        log("lens: fisheye preset applied for %.0f deg (feq=%.1f, fpx=%.1f)."
+            % (fov, r["feq"], r["fpx"]))
+        log("lens: a preset assumes an ideal equidistant lens. Measure beats it.")
+        log("Press 'Save to gun' to keep it across power cycles.")
+
+    lens_busy = {"on": False}
+
+    def lens_measure():
+        if lens_busy["on"]:
+            log("lens: a measurement is already running"); return
+        fov = fov_value()
+        if fov is None: return
+        if not link.src:
+            log("lens: not connected"); return
+        lens_busy["on"] = True
+        # raw data: resolver off (it invents corners), correction off (fitting
+        # corrected data fits garbage), full frame rate
+        link.send("~cam=res:0,lens:0,dashhz:0")
+        log("lens: MEASURING for 20 s. Stand ~2 m from the rig, feet planted,")
+        log("and slowly pan/tilt/roll the gun so the LEDs travel across the")
+        log("WHOLE image -- push them out to the edges and corners. Keep all")
+        log("four in frame.")
+        t0 = time.time()
+        frames = []
+        # hist timestamps are the GUN's clock, not ours -- comparing them
+        # against time.time() collects garbage. Accumulate by identity instead:
+        # every (gun-time, quad) pair not seen before is a new frame.
+        seen = set()
+
+        def collect():
+            for (gt, q) in link.hist:
+                if gt not in seen:
+                    seen.add(gt)
+                    frames.append(np.asarray(q, float))
+            left = 20.0 - (time.time() - t0)
+            if left > 0:
+                lens_state.config(text="measuring... %2.0f s left, %d frames"
+                                  % (left, len(frames)), fg=C_WARN)
+                root.after(250, collect)
+                return
+            link.send("~cam=res:2,dashhz:60")
+            lens_state.config(text="fitting...", fg=C_WARN)
+            snap = np.array(frames) if frames else np.zeros((0, 4, 2))
+
+            def fit():
+                r = calib_lens.fit_from_frames(snap, fov)
+
+                def done():
+                    lens_busy["on"] = False
+                    if not r["ok"]:
+                        lens_state.config(text="measure failed -- see the log", fg=C_BAD)
+                        log("lens: REFUSED: %s" % r["why"])
+                        return
+                    link.send("~cam=" + calib_lens.tune_line(r))
+                    lens_state.config(
+                        text="measured: %s  rms %.2f px  (coverage %.0f%%)"
+                             % (r["model"], r["rms_px"], r["coverage"] * 100), fg=C_OK)
+                    log("lens: fitted %s model, residual %.2f px rms." % (r["model"], r["rms_px"]))
+                    if r["rms_px"] > 1.0:
+                        log("lens: residual is high -- consider redoing the sweep more slowly.")
+                    log("Applied live. Press 'Save to gun' to keep it across power cycles.")
+                root.after(0, done)
+            threading.Thread(target=fit, daemon=True).start()
+        root.after(250, collect)
+
+    rowb = tk.Frame(tab_lens, bg=C_BG); rowb.pack(fill="x", pady=6)
+    tk.Button(rowb, text="Stock lens (off)", command=lens_off, font=F, bg="#161b22",
+              fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left")
+    tk.Button(rowb, text="Preset from FOV", command=lens_preset, font=FB, bg="#1f6feb",
+              fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
+    tk.Button(rowb, text="Measure (20 s sweep)", command=lens_measure, font=FB,
+              bg="#1f6feb", fg="white", relief="flat", padx=12, pady=6).pack(side="left")
+    tk.Button(rowb, text="Save to gun", command=lambda: (link.send("~camsave"), log("~camsave sent")),
+              font=FB, bg="#238636", fg="white", relief="flat", padx=12, pady=6).pack(side="left", padx=8)
+    tk.Button(rowb, text="Read from gun", command=lambda: link.send("~cam?"),
+              font=F, bg="#161b22", fg=C_FG, relief="flat", padx=12, pady=6).pack(side="left")
+    lab(tab_lens, "Wide lens trade-off: more FOV = stand closer and less edge "
+        "clipping, but every\nnoise source is magnified by the shorter focal. "
+        "The stock 66\u00b0 lens needs nothing here.", (F[0], 8), C_DIM,
+        justify="left", anchor="w").pack(fill="x", pady=(2, 4))
+
+    def lens_tick():
+        # keep the state line honest from the gun's own cam? replies
+        if not lens_busy["on"] and "lens" in link.last:
+            m = link.last.get("lens", 0)
+            if m == 0:
+                lens_state.config(text="current: correction OFF (stock lens)", fg=C_DIM)
+            elif m == 1:
+                lens_state.config(text="current: polynomial  k1=%dppm k2=%dppm fpx=%.1f"
+                                  % (link.last.get("lk1u", 0), link.last.get("lk2u", 0),
+                                     link.last.get("lfpx", 0) / 10.0), fg=C_OK)
+            else:
+                lens_state.config(text="current: fisheye  feq=%.1f fpx=%.1f"
+                                  % (link.last.get("lfeq", 0) / 10.0,
+                                     link.last.get("lfpx", 0) / 10.0), fg=C_OK)
+        root.after(500, lens_tick)
+    root.after(500, lens_tick)
+
     # ---- pointer toggle ---------------------------------------------------
     def refresh_hid():
         if link.hid_on:
@@ -442,9 +637,11 @@ def main():
         log("Pointer %s." % ("released -- the gun drives the cursor again"
                              if link.hid_on else
                              "frozen -- the gun stops driving the cursor. "
-                             "Steps 3 and 4 release it automatically."))
+                             "Steps 4 to 6 release it automatically."))
 
-    # Window-scoped, not a global hook: focus the window and press F9.
+    # Window-scoped, not system-wide: a global hook would need an extra package
+    # and the ability to swallow F9 from every other application, which is a lot
+    # of blast radius for a convenience. Focus the window and press F9.
     root.bind("<F9>", toggle_hid)
     root.bind("<KeyPress-F9>", toggle_hid)
 
@@ -518,19 +715,19 @@ def main():
                 text=("good -- ready to calibrate" if sg <= SIGMA_GOOD else
                       "usable, could be better" if sg <= SIGMA_OK else
                       "too noisy -- tune before calibrating"), fg=col)
-        # step 3 is gated on step 2, and the label says why
+        # the calibration step is gated on step 2, and the label says why
         if sg is not None and sg > SIGMA_OK:
-            step_rows[3][1].config(text="   blocked: blob noise %.2f px is too high" % sg, fg=C_BAD)
+            step_rows[4][1].config(text="   blocked: blob noise %.2f px is too high" % sg, fg=C_BAD)
         else:
-            step_rows[3][1].config(text="   five dots x %d distances" % stance_n.get(),
+            step_rows[4][1].config(text="   five dots x %d distances" % stance_n.get(),
                                    fg=C_DIM)
         root.after(50, tick)
 
-    log("Lightgun Studio. Step 1 sets up buttons; steps 2-4 are ours.")
+    log("Lightgun Studio. Step 1 sets up buttons; steps 2-6 are ours.")
     log("The gun keeps driving the cursor. Press F9 to freeze it while you work")
-    log("in here; steps 3 and 4 release it on their own and put it back after.")
+    log("in here; steps 4 to 6 release it on their own and put it back after.")
     log("Order matters: aim accuracy is limited by blob noise, so tune before you")
-    log("calibrate. The app blocks step 3 if the noise floor is too high.")
+    log("calibrate. The app blocks step 4 if the noise floor is too high.")
     reconnect()
     root.after(50, tick)
     try:
