@@ -77,6 +77,23 @@ bool aim_cam_load(aim_cam_t* out);     // false if nothing stored
 bool aim_cam_store(const aim_cam_t* c);
 bool aim_cam_clear(void);
 
+// Lens undistortion parameters, own NVS key so aim_cam_t's size check stays
+// untouched. model 0=off, 1=poly barrel (k1,k2), 2=fisheye equidistant.
+typedef struct {
+    int   model;
+    float k1, k2;
+    float fpx, feq;
+} aim_lens_t;
+
+bool aim_lens_load(aim_lens_t* out);
+bool aim_lens_store(const aim_lens_t* c);
+bool aim_lens_clear(void);
+
+// Boot forensics: a silent idle reboot becomes diagnosable from one ~ping.
+uint32_t    aim_boot_count(void);
+const char* aim_reset_reason(void);
+uint32_t    aim_uptime_s(void);
+
 // Installs an output sink so replies go back on the channel the command arrived
 // on. Pass 0 for printf.
 void aim_set_out(void (*fn)(const char*));
