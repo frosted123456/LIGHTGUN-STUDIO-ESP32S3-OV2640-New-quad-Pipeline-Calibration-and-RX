@@ -1132,6 +1132,17 @@ int ov2640_capture_start(void)
             s_lead_ms = (float)lead_ms;
             printf("CAM: restored lead=%dms from NVS\n", lead_ms);
         }
+        // Lens is pure software state (no sensor registers), so the boot-recipe
+        // ordering that bit the AEC/AGC restore cannot bite here.
+        aim_lens_t ls;
+        if (aim_lens_load(&ls)) {
+            s_lens = (uint8_t)ls.model;
+            s_lk1  = ls.k1;  s_lk2  = ls.k2;
+            s_lfpx = ls.fpx; s_lfeq = ls.feq;
+            printf("CAM: restored lens=%d k1=%.4f k2=%.4f fpx=%.1f feq=%.1f from NVS\n",
+                   ls.model, (double)ls.k1, (double)ls.k2,
+                   (double)ls.fpx, (double)ls.feq);
+        }
     }
 #endif
     // SCCB ACK check and retry. A transient NACK on the 0xFF bank-select leaves
@@ -1210,20 +1221,31 @@ extern "C" bool ov2640_cam_command(const char* line)
         aim_cam_t cs = { (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost };
         const bool ok = aim_cam_store(&cs);
         aim_lead_store((int)s_lead_ms);
-        ov_reply(ok
-                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms\n"
-                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms\n",
-                 cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms);
+        // Lens rides along; model 0 clears rather than stores, so a stale
+        // stored lens cannot survive a return to the stock lens.
+        aim_lens_t ls = { (int)s_lens, s_lk1, s_lk2, s_lfpx, s_lfeq };
+        bool lens_ok = true;
+        if (ls.model == 0) aim_lens_clear();
+        else               lens_ok = aim_lens_store(&ls);
+        ov_reply(ok && lens_ok
+                 ? "CAM: saved thr=%d aec=%d agc=%d boost=%d lead=%dms lens=%d\n"
+                 : "CAM: SAVE FAILED (values out of range?) thr=%d aec=%d agc=%d boost=%d lead=%dms lens=%d\n",
+                 cs.thr, cs.aec, cs.agc, cs.boost, (int)s_lead_ms, ls.model);
         return true;
     }
     if (!strncmp(line, "camreset", 8)) {
         aim_cam_clear();
-        ov_reply("CAM: stored settings cleared; next boot uses the built-in recipe\n");
+        aim_lens_clear();
+        ov_reply("CAM: stored settings cleared (camera + lens); next boot uses the built-in recipe\n");
         return true;
     }
     if (!strncmp(line, "cam?", 4)) {
-        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d\n",
-                 (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost);
+        // Everything the tools read back, one line: lead and lens included.
+        ov_reply("CAM: thr=%d aec=%d agc=%d boost=%d lead=%d "
+                 "lens=%d lk1u=%d lk2u=%d lfpx=%d lfeq=%d vfill=%d\n",
+                 (int)THR, s_cfg_aec, s_cfg_agc, s_cfg_boost, (int)s_lead_ms,
+                 (int)s_lens, (int)(s_lk1*1e6f), (int)(s_lk2*1e6f),
+                 (int)(s_lfpx*10.0f), (int)(s_lfeq*10.0f), (int)s_vfill_pct);
         return true;
     }
 #endif
