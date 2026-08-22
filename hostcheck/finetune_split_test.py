@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Fine-tune must split a sight offset into its angular and parallax parts, which
-behave OPPOSITELY with distance. Two nudges at different distances must separate
-them; two at the same distance must be refused.
-"""
+"""Fine-tune math: the angular/parallax split across distances, the single-
+station SAVE NOW path (saved == the live preview, no double stacking), and the
+lead 'worth' readout being in screen units."""
 import sys, os
 import numpy as np
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tools"))
@@ -80,8 +79,10 @@ if r is not None:
 
 
 # ---------------------------------------------------------------------------
-# The "worth about N screen px" readout must be in SCREEN units: a camera pixel
-# is worth about 26 screen px here, not 1920/240 = 8.
+# The "worth about N screen px" readout. It has to be in SCREEN units: the
+# first version differenced camera pixels and divided by the CAMERA frame
+# width, which is low by the whole master gain -- a camera pixel is worth about
+# 26 screen px here, not 1920/240 = 8.
 def _worth_check():
     src = gun(0.0, (5.0, -3.0))
     cc = calibrate(src)
@@ -107,7 +108,10 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Shooting the ring must MEASURE the offset, not merely record the pose.
+# Shooting the ring must MEASURE the offset, not just record the pose. The
+# first version stored the quad and left the whole correction to the arrow
+# buttons, so a user who shot the ring and read the display saw "0, 0 px"
+# however far off the cursor actually was.
 def _measure_check():
     import aim_finetune as FT
     src = gun(0.03, (11.0, -3.0))            # a gun with a real sight offset
@@ -155,5 +159,55 @@ if _m:
 print()
 for f in fails:
     print("  [FAIL] %s" % f)
+# ---------------------------------------------------------------------------
+# SAVE NOW: the single-station direct save. What is saved must be EXACTLY the
+# preview on screen, it must not require a ring shot, and shooting the ring
+# after manual nudges must converge instead of stacking.
+# ---------------------------------------------------------------------------
+import aim_finetune
+
+t = aim_finetune.Tuner(dict(c))
+if t.solve_direct() is not None:
+    fails.append("empty direct save was not refused")
+else:
+    print("\nempty direct save -> refused (nothing to keep yet)")
+for _ in range(3):
+    t.nudge(+1, 0)
+t.nudge(0, +2)
+out = t.solve_direct()
+if out is None:
+    fails.append("manual-only save refused")
+else:
+    pv = t.preview()
+    if any(abs(out[k] - pv[k]) > 1e-12 for k in ("cx", "cy", "w", "h", "bx", "by")):
+        fails.append("direct save differs from the live preview")
+    if abs(out["w"] - c["w"]) > 1e-12 or abs(out["bx"] - c["bx"]) > 1e-12:
+        fails.append("direct save disturbed the fitted geometry")
+    print("manual-only save -> the preview itself; bore and rectangle untouched")
+
+# no double stacking: a deliberate wrong nudge, then ring shots on a known-good
+# aim. The first shot must cancel the nudge; the second must change ~nothing.
+src0 = CASES[3][1]                       # 'nothing wrong'
+t2 = aim_finetune.Tuner(dict(c))
+q = src0._quad(aim_finetune.TARGET[0], aim_finetune.TARGET[1], NEAR, 0.0, stance=0, dot=0)
+t2.nudge(+5, 0)
+t2.note_quad(q)
+a = t2.off[0].copy()
+t2.note_quad(q)
+b = t2.off[0].copy()
+move2 = float(np.hypot((b - a)[0] * 1920.0, (b - a)[1] * 1200.0))
+resid = aim_fit.solve(t2.preview(), q, FW, FH)
+left = float(np.hypot((resid[0] - aim_finetune.TARGET[0]) * 1920.0,
+                      (resid[1] - aim_finetune.TARGET[1]) * 1200.0))
+print("wrong nudge + ring shot -> %.2f px from the ring; second shot moved %.2f px"
+      % (left, move2))
+if left > 1.0:
+    fails.append("ring shot after a manual nudge did not cancel it (%.2f px left)" % left)
+if move2 > 0.5:
+    fails.append("repeat ring shot double-stacked (%.2f px)" % move2)
+
 print("finetune split: %s" % ("ALL PASS" if not fails else "FAILED"))
+if fails:
+    for f in fails: print("  -", f)
 sys.exit(1 if fails else 0)
+
