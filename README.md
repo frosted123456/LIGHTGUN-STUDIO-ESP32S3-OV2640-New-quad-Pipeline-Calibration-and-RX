@@ -93,9 +93,7 @@ It is only used to set buttons and pins in step 1 — it is not needed to build.
 
 > **Do step 1 first.** This folder does not contain OpenFIRE, so a fresh
 > checkout has nothing to compile until the patcher has run. Building first
-> fails with `UnknownBoard: Unknown board ID ...` or a wall of missing headers,
-> neither of which points at the real cause. The build now stops with a plain
-> message instead, but the fix is the same: run step 1.
+> fails with `UnknownBoard: Unknown board ID ...` or a wall of missing header
 
 **1. Get OpenFIRE and apply the overlay — one command.**
 
