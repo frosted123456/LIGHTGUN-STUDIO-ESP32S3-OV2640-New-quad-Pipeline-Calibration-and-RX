@@ -11,10 +11,13 @@
   // Must be the real header: a hand-written extern here gets C++ linkage and
   // fails to link.
   #include "esp_timer.h"
+  #include "esp_system.h"   // esp_reset_reason(), for the boot forensics
   #define AIM_NVS_NS   "aimcal"
   #define AIM_NVS_KEY  "c0"
   #define AIM_NVS_CAM  "cam0"
   #define AIM_NVS_LEAD "lead0"
+  #define AIM_NVS_LENS "lens0"
+  #define AIM_NVS_BOOT "boots"
 #endif
 
 // ---- reply output --------------------------------------------------------
@@ -251,6 +254,108 @@ bool aim_cam_clear(void)
     return true;
 }
 
+// Same ranges the tune console accepts; NaN-safe (x==x).
+static bool lens_plausible(const aim_lens_t* c)
+{
+    if (!c) return false;
+    if (c->model < 0 || c->model > 2) return false;
+    if (!(c->k1 == c->k1) || c->k1 < -2.0f || c->k1 > 2.0f) return false;
+    if (!(c->k2 == c->k2) || c->k2 < -2.0f || c->k2 > 2.0f) return false;
+    if (!(c->fpx == c->fpx) || c->fpx < 10.0f || c->fpx > 2000.0f) return false;
+    if (!(c->feq == c->feq) || c->feq < 10.0f || c->feq > 2000.0f) return false;
+    return true;
+}
+
+bool aim_lens_load(aim_lens_t* out)
+{
+#if defined(ESP_PLATFORM)
+    if (!out) return false;
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READONLY, &h) != ESP_OK) return false;
+    size_t len = sizeof(*out);
+    const esp_err_t e = nvs_get_blob(h, AIM_NVS_LENS, out, &len);
+    nvs_close(h);
+    return (e == ESP_OK && len == sizeof(*out) && lens_plausible(out));
+#else
+    (void)out; return false;
+#endif
+}
+
+bool aim_lens_store(const aim_lens_t* c)
+{
+    if (!lens_plausible(c)) return false;
+#if defined(ESP_PLATFORM)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return false;
+    esp_err_t e = nvs_set_blob(h, AIM_NVS_LENS, c, sizeof(*c));
+    if (e == ESP_OK) e = nvs_commit(h);
+    nvs_close(h);
+    return e == ESP_OK;
+#else
+    return true;
+#endif
+}
+
+bool aim_lens_clear(void)
+{
+#if defined(ESP_PLATFORM)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) == ESP_OK) {
+        nvs_erase_key(h, AIM_NVS_LENS); nvs_commit(h); nvs_close(h);
+    }
+#endif
+    return true;
+}
+
+// Boot forensics.
+static uint32_t s_boot_count = 0;
+
+uint32_t aim_boot_count(void) { return s_boot_count; }
+
+uint32_t aim_uptime_s(void)
+{
+#if defined(ESP_PLATFORM)
+    return (uint32_t)(esp_timer_get_time() / 1000000LL);
+#else
+    return 0;
+#endif
+}
+
+const char* aim_reset_reason(void)
+{
+#if defined(ESP_PLATFORM)
+    switch (esp_reset_reason()) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_SW:        return "SW";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WDT";
+        case ESP_RST_TASK_WDT:  return "TASK_WDT";
+        case ESP_RST_WDT:       return "WDT";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+#else
+    return "HOST";
+#endif
+}
+
+// Counts this boot; failures ignored -- a diagnostic must never block aiming.
+static void boot_count_bump(void)
+{
+#if defined(ESP_PLATFORM)
+    nvs_handle_t h;
+    if (nvs_open(AIM_NVS_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    uint32_t v = 0;
+    nvs_get_u32(h, AIM_NVS_BOOT, &v);
+    s_boot_count = v + 1u;
+    nvs_set_u32(h, AIM_NVS_BOOT, s_boot_count);
+    nvs_commit(h);
+    nvs_close(h);
+#endif
+}
+
 static bool s_hid = true;   // RAM only, and it boots enabled
 
 // Reports whether the gun may drive the cursor.
@@ -263,6 +368,7 @@ void aim_runtime_begin(void)
 {
     memset(&s_c, 0, sizeof(s_c));
     s_enabled = true;
+    boot_count_bump();
     aim_calib_t t;
     if (nvs_load(&t) && plausible(&t)) {
         s_c = t;
@@ -386,9 +492,14 @@ bool aim_runtime_command(const char* line)
     // A leading '~' is optional, so both transports accept the same dialect.
     if (*line == '~') ++line;
     if (!strncmp(line, "ping", 4)) {
-        aim_out("AIM: pong  calib=%s filter=%.2f/%.2f capture=%s\n",
+        // up/boots/rst: a silent idle reboot shows here -- short uptime, boots
+        // one higher, and the reset reason names the culprit.
+        aim_out("AIM: pong  calib=%s filter=%.2f/%.2f capture=%s"
+                "  up=%lus boots=%lu rst=%s\n",
                 plausible(&s_c) ? (s_enabled ? "active" : "loaded") : "none",
-                (double)s_fc, (double)s_beta, s_capture ? "on" : "off");
+                (double)s_fc, (double)s_beta, s_capture ? "on" : "off",
+                (unsigned long)aim_uptime_s(), (unsigned long)aim_boot_count(),
+                aim_reset_reason());
         return true;
     }
     if (!strncmp(line, "aimhid", 6)) {
