@@ -55,9 +55,19 @@
  #include "boards/OpenFIREshared.h"
  #include "OpenFIREcolors.h"
  #include "OpenFIRElights.h"
-@@ -648,6 +696,10 @@
+@@ -647,7 +695,20 @@
+         #endif // USES_DISPLAY
  
          while(!(FW_Common::buttons.pressedReleased == FW_Const::BtnMask_Trigger) || FW_Common::camNotAvailable) {
++#ifdef USE_AIM_PIPELINE
++            // Do not hold a fresh gun here: the overlay's calibration lives in
++            // its own NVS namespace, so OpenFIRE's zeroed edge offsets say
++            // nothing about it, and this loop never reaches the Run loop that
++            // emits the trigger markers our calibration tool captures on. A
++            // camera that failed to start still holds.
++            if(!FW_Common::camNotAvailable)
++                break;
++#endif
              // Check and process serial commands, in case user needs to change EEPROM settings.
 +#ifdef USE_AIM_PIPELINE
 +            // Service the '~' channel while docked.
@@ -66,7 +76,20 @@
              if(Serial.available())
                  OF_Serial::SerialProcessingDocked();
              
-@@ -770,9 +822,19 @@
+@@ -692,7 +753,12 @@
+         // skip cali if we're prematurely set to run from the above loop
+         // (i.e. cal'd from Desktop)
+         if(FW_Common::gunMode != FW_Const::GunMode_Run)
++#ifdef USE_AIM_PIPELINE
++            // Straight to Run: calibration is the overlay tool's job.
++            FW_Common::SetMode(FW_Const::GunMode_Run);
++#else
+             FW_Common::SetMode(FW_Const::GunMode_Calibration);
++#endif
+     } else {
+         // this will turn off the DotStar/RGB LED and ensure proper transition to Run
+         FW_Common::SetMode(FW_Const::GunMode_Run);
+@@ -770,9 +836,19 @@
      rp2040.fifo.pop();
      #endif
      while(FW_Common::gunMode == FW_Const::GunMode_Run) {
@@ -86,7 +109,7 @@
          #ifdef USES_TEMP
              if(OF_Prefs::pins[OF_Const::tempPin] > -1)
                  OF_FFB::TemperatureUpdate();
-@@ -793,6 +855,10 @@
+@@ -793,6 +869,10 @@
              FW_Common::buttons.SendReports();
          }
  
@@ -97,7 +120,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -897,6 +963,10 @@
+@@ -897,6 +977,10 @@
      }
  
      #ifdef MAMEHOOKER
@@ -108,7 +131,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
      #endif // MAMEHOOKER
  
-@@ -1275,6 +1345,10 @@
+@@ -1275,6 +1359,10 @@
          }
  
          // Run through serial receive buffer once this run, if it has contents.
@@ -119,7 +142,7 @@
          if(Serial.available()) OF_Serial::SerialProcessing();
  
          #ifdef MAMEHOOKER
-@@ -1481,6 +1555,10 @@
+@@ -1481,6 +1569,10 @@
              #endif // USES_ANALOG
          }
  
