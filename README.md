@@ -195,10 +195,13 @@ Five steps, in order. Order matters: aim accuracy is limited by camera noise, so
 tuning before calibrating is not optional — the app blocks step 3 if the noise
 floor is too high.
 
-**1 — Buttons & pins.** Opens the OpenFIRE desktop app, which needs the serial
-port to itself. Set your trigger and pins there, then just close it — Studio
-waits for it to exit, takes the port back and reconnects on its own. `Reconnect`
-in the header is there if you ever need to force it.
+1 — Buttons & pins. Opens the OpenFIRE desktop app, which needs the serial port 
+to itself. You do not need to run OpenFIRE's own calibration — this build skips 
+its first-boot hold and goes straight to Run mode, because the overlay stores 
+its calibration separately and steps 3 to 5 replace that job. Set your trigger 
+and pins there, then just close it — Studio waits for it to exit, takes the port 
+back and reconnects on its own. Reconnect in the header is there if you ever need 
+to force it.
 
 **2 — Camera tuning.** Exposure, gain and threshold. Aim for a blob noise floor
 **under 0.30 px**; 0.60 is the limit. `Auto` sweeps for you.
