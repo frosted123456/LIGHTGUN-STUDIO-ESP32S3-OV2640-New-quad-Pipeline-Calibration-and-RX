@@ -152,6 +152,15 @@ else
     echo "retry waits for a fresh trigger: FAILED"; exit 1
 fi
 
+# Lens fit machinery: recover known synthetic lenses, refuse bad sweeps.
+if python3 tools/calib_lens.py selftest > /tmp/ov_lens.out 2>&1 \
+   && grep -q "SELFTEST PASSED" /tmp/ov_lens.out; then
+    echo "lens fit selftest: OK"
+else
+    cat /tmp/ov_lens.out 2>/dev/null
+    echo "lens fit selftest: FAILED"; exit 1
+fi
+
 # Step 1 gives the port to the OpenFIRE app; coming back from that is ours to
 # do, and it must always finish so the UI cannot park on 'handed off'.
 if python3 hostcheck/port_handoff_test.py > /tmp/ov_hand.out 2>&1 \
